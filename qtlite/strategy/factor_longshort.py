@@ -19,9 +19,7 @@ import numpy as np
 import pandas as pd
 
 from qtlite.core.interfaces import Strategy, StrategyContext
-from qtlite.core.enums import SignalType, PositionSide
-from qtlite.core.utils import align_panels
-
+from qtlite.core.enums import SignalType
 
 DataPanel = pd.DataFrame
 
@@ -32,24 +30,7 @@ DataPanel = pd.DataFrame
 class FactorLongShortConfig:
     """
     单因子多空策略配置（截面分组 → top vs bottom）.
-
-    Attributes
-    ----------
-    factor_name : str
-        使用哪个因子作为打分；必须存在于 factors 字典中。
-    n_quantiles : int
-        截面分成多少组（默认 5 组）。
-    top_quantile : int
-        作为“多头”的组号（1..n_quantiles，默认最高那组）。
-    bottom_quantile : int
-        作为“空头”的组号（1..n_quantiles，默认最低那组）。
-    gross_leverage : float
-        组合总名义（多头绝对值 + 空头绝对值），默认 1.0。
-        例如：gross=1.0，则多头≈0.5，空头≈-0.5。
-    min_names_per_side : int
-        每边至少持有多少只股票，如果不足则当日空仓。
     """
-
     factor_name: str
     n_quantiles: int = 5
     top_quantile: Optional[int] = None
@@ -61,23 +42,7 @@ class FactorLongShortConfig:
 @dataclass
 class FactorTopKConfig:
     """
-    单因子多头策略配置（只做 top K / top quantile）。
-
-    Attributes
-    ----------
-    factor_name : str
-        因子名。
-    top_frac : float
-        每日选择前多少比例的股票（例如 0.1 表示前 10%）。
-        若同时给定 top_quantile，则以 quantile 为主。
-    n_quantiles : int
-        使用分组方式时的组数。
-    top_quantile : Optional[int]
-        直接使用第 top_quantile 组作为多头；若为 None，则按 top_frac 选股。
-    gross_exposure : float
-        组合总多头暴露（通常=1.0）。
-    min_names : int
-        至少持有多少只股票，不足则当日空仓。
+    单因子多头策略配置（只做 top K / top quantile）.
     """
     factor_name: str
     top_frac: float = 0.1
@@ -94,13 +59,7 @@ class FactorLongShortStrategy(Strategy):
     单因子多空策略（top vs bottom）.
 
     - signal_type = WEIGHT
-    - 返回的是“目标权重”矩阵，可以直接给 SimpleBacktestEngine 使用。
-
-    权重构造规则（每个交易日）：
-    1. 取当日因子截面，按 rank → qcut 分成 n_quantiles 组，标签 1..n_quantiles。
-    2. 选出 top_quantile 做多，bottom_quantile 做空。
-    3. 多头等权加总为 +gross_leverage/2，空头等权加总为 -gross_leverage/2。
-    4. 其余股票权重为 0。
+    - 返回的是“目标权重”矩阵（DataFrame），可以直接给 SimpleBacktestEngine 使用。
     """
 
     def __init__(self, cfg: FactorLongShortConfig, name: Optional[str] = None):
@@ -111,7 +70,7 @@ class FactorLongShortStrategy(Strategy):
     def generate_signals(
         self,
         factors: Mapping[str, DataPanel],
-        context: StrategyContext,
+        context: StrategyContext | None,
     ) -> DataPanel:
         # 1) 取因子
         if self.cfg.factor_name not in factors:
@@ -187,10 +146,8 @@ class FactorLongShortStrategy(Strategy):
 
         # 4) 组装成 DataFrame（date × asset）
         weights = pd.DataFrame(w_list, index=idx_list).sort_index()
-        # 用因子列全集对齐（缺的填0）
         weights = weights.reindex(columns=f.columns).fillna(0.0)
 
-        # 若 context.side = LONG_ONLY，则引擎层会进一步截断负权重，这里不额外处理
         return weights
 
 
@@ -210,7 +167,7 @@ class FactorTopKLongStrategy(Strategy):
     def generate_signals(
         self,
         factors: Mapping[str, DataPanel],
-        context: StrategyContext,
+        context: StrategyContext | None,
     ) -> DataPanel:
         if self.cfg.factor_name not in factors:
             raise KeyError(f"Factor '{self.cfg.factor_name}' not found in factors dict")
@@ -271,5 +228,4 @@ class FactorTopKLongStrategy(Strategy):
         weights = pd.DataFrame(w_list, index=idx_list).sort_index()
         weights = weights.reindex(columns=f.columns).fillna(0.0)
 
-        # 若 context.side = LONG_ONLY，引擎会保持 long-only；这里已经没有负权重
         return weights

@@ -126,8 +126,6 @@ class SimpleBacktestEngine:
 
         # 对齐信号 & 收益
         raw_signals, rets = align_panels([raw_signals, rets])
-        raw_signals = raw_signals[0]
-        rets = rets[1]
 
         # 4) 将 signal 转换为权重（若本身就是 WEIGHT 就直接用）
         weights = self._signals_to_weights(raw_signals, strategy, context)
@@ -153,6 +151,7 @@ class SimpleBacktestEngine:
         port_ret, turnover = self._portfolio_returns(
             weights=weights,
             rets=rets,
+            transaction_cost=self.cfg.transaction_cost,
         )
 
         # 9) 生成 NAV
@@ -209,15 +208,16 @@ class SimpleBacktestEngine:
             w = signals.apply(_to_w, axis=1)
 
         # 如果是 LONG_ONLY，截断负权重并再归一化
-        if context.side == PositionSide.LONG_ONLY:
-            def _long_only(s: pd.Series) -> pd.Series:
+        side = getattr(context, "side", None)  # 允许 context 为 None
+        if side == PositionSide.LONG_ONLY:
+            def _clip_long_only(s: pd.Series) -> pd.Series:
                 s = s.clip(lower=0.0)
                 total = s.sum()
                 if total == 0:
                     return s
                 return s / total
 
-            w = w.apply(_long_only, axis=1)
+            w = w.apply(_clip_long_only, axis=1)
 
         return w
 
@@ -225,59 +225,95 @@ class SimpleBacktestEngine:
         self,
         weights: DataPanel,
         rets: DataPanel,
-    ) -> tuple[pd.Series, pd.Series]:
-        """
-        组合收益 & 换手率
-        - 当前权重 * 当期个股收益 -> 组合收益
-        - turnover ≈ 0.5 * sum(|w_t - w_{t-1}|)
+        transaction_cost: float,
+    ):
+        # ✅ 不要再 weights[0] 了；如果以后某处真的传了 tuple，
+        #    最多在这里做个兼容防御式处理（可选）：
+        if isinstance(weights, tuple):
+            weights = weights[0]
 
-        交易成本 & 滑点按换手率线性扣减。
-        """
-        weights, rets = align_panels([weights, rets])
-        weights = weights[0]
-        rets = rets[1]
+        # 假设 weights / rets 已经在 run() 里用 align_panels 对齐过
+        weights = weights.sort_index()
+        rets = rets.sort_index()
 
-        # 组合收益（不含成本）
-        gross_ret = (weights * rets).sum(axis=1)
+        # 前一日权重（用于计算换手）
+        w_prev = weights.shift(1).fillna(0.0)
 
-        # 换手率
-        prev_w = weights.shift(1).fillna(0.0)
-        turnover = 0.5 * (weights - prev_w).abs().sum(axis=1)
+        # 日度换手率（绝对变化之和）
+        turnover = (weights - w_prev).abs().sum(axis=1)
 
-        # 成本 = (交易成本 + 滑点) * 换手率
-        cost_rate = self.cfg.transaction_cost + self.cfg.slippage
-        net_ret = gross_ret - cost_rate * turnover
+        # 日度组合收益：权重 · 收益 - 手续费 * 换手
+        port_ret = (weights * rets).sum(axis=1) - float(transaction_cost) * turnover
 
-        return net_ret, turnover
-
+        return port_ret, turnover
+    
     def _compute_metrics(
         self,
         port_ret: pd.Series,
         nav: pd.Series,
-        benchmark_prices: Optional[DataPanel],
-    ) -> Dict[str, float]:
+        benchmark_prices: Optional[pd.DataFrame] = None,
+    ) -> dict:
         """
-        计算基本绩效指标：年化收益、波动率、Sharpe、最大回撤、IR（如果有 benchmark）。
+        计算基础回测指标：
+        - annual_return: 年化收益
+        - annual_vol: 年化波动率
+        - sharpe: 年化 Sharpe（假设无风险利率=0）
+        - max_drawdown: 最大回撤
+        - ir: 信息比率（如果提供 benchmark_prices，否则为 None）
         """
-        pp_year = self.cfg.periods_per_year
+        metrics: dict[str, float] = {}
 
-        m: Dict[str, float] = {}
-        m["ann_return"] = ann_return(port_ret, pp_year)
-        m["ann_vol"] = ann_vol(port_ret, pp_year)
-        m["sharpe"] = sharpe_ratio(port_ret, periods_per_year=pp_year)
-        m["max_drawdown"] = max_drawdown(nav)
+        if port_ret.empty:
+            return {
+                "annual_return": 0.0,
+                "annual_vol": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "ir": None,
+            }
 
-        # 可选：基准 IR
+        ann_factor = 252.0
+
+        # 年化收益
+        ann_ret = float(port_ret.mean() * ann_factor)
+
+        # 年化波动
+        ann_vol = float(port_ret.std(ddof=0) * np.sqrt(ann_factor))
+
+        # Sharpe
+        if ann_vol > 0:
+            sharpe = ann_ret / ann_vol
+        else:
+            sharpe = 0.0
+
+        # 最大回撤
+        roll_max = nav.cummax()
+        dd = nav / roll_max - 1.0
+        max_dd = float(dd.min())
+
+        # 信息比率（如果有 benchmark）
         if benchmark_prices is not None:
-            bench_ret = benchmark_prices.iloc[:, 0].pct_change().reindex(
-                port_ret.index
+            bench_ret = (
+                benchmark_prices.pct_change()
+                .mean(axis=1)
+                .reindex(port_ret.index)
+                .fillna(0.0)
             )
-            from qtlite.core.metrics import information_ratio
+            excess = port_ret - bench_ret
+            excess_ret = float(excess.mean() * ann_factor)
+            excess_vol = float(excess.std(ddof=0) * np.sqrt(ann_factor))
+            if excess_vol > 0:
+                ir = excess_ret / excess_vol
+            else:
+                ir = 0.0
+        else:
+            ir = None
 
-            m["information_ratio"] = information_ratio(
-                port_ret,
-                bench_ret,
-                periods_per_year=pp_year,
-            )
+        metrics["annual_return"] = ann_ret
+        metrics["annual_vol"] = ann_vol
+        metrics["sharpe"] = sharpe
+        metrics["max_drawdown"] = max_dd
+        metrics["ir"] = ir
 
-        return m
+        return metrics
+
